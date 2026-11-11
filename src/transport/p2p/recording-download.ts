@@ -20,7 +20,7 @@
  *
  * @module p2p/recording-download
  */
-import { createDecipheriv } from "node:crypto";
+import { constants, createDecipheriv, generateKeyPairSync, privateDecrypt, type KeyObject } from "node:crypto";
 import { RecordingDownloadError, type RecordingDownload } from "../../core/contracts.js";
 import { CommandType } from "./commands.js";
 import type { P2PFrame, P2PSession } from "./p2p-session.js";
@@ -96,7 +96,15 @@ export interface RecordingTransfer {
  */
 export function receiveRecording(
   session: P2PSession,
-  request: { path: string; accountId: string; channel: number; timeoutMs?: number; signal?: AbortSignal },
+  request: {
+    path: string;
+    accountId: string;
+    channel: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    /** LOCAL: the modulus of the client's own RSA key, for a camera that is its own station (see rsaRecordingKey). */
+    rsaModulusHex?: string;
+  },
 ): RecordingTransfer {
   let resolveFrames!: (frames: RecordingFrame[]) => void;
   let rejectFrames!: (error: Error) => void;
@@ -179,7 +187,21 @@ export function receiveRecording(
   request.signal?.addEventListener("abort", onAbort, { once: true });
   session.on("data", onData);
   try {
-    session.sendStringPairCommand(CommandType.CMD_DOWNLOAD_VIDEO, request.path, request.accountId, request.channel);
+    if (request.rsaModulusHex) {
+      // LOCAL: the download request that carries the client's own public key; the camera seals each keyframe's
+      // AES key under it.
+      session.sendStringPayloadCommand(
+        CommandType.CMD_DOWNLOAD_VIDEO,
+        JSON.stringify({
+          account_id: request.accountId,
+          cmd: CommandType.CMD_DOWNLOAD_VIDEO,
+          mChannel: request.channel,
+          mValue3: CommandType.CMD_DOWNLOAD_VIDEO,
+          payload: { filepath: request.path, key: request.rsaModulusHex },
+        }),
+        request.channel,
+      );
+    } else session.sendStringPairCommand(CommandType.CMD_DOWNLOAD_VIDEO, request.path, request.accountId, request.channel);
   } catch (error) {
     deliver(error instanceof Error ? error : new Error(String(error)));
     stop();
@@ -267,5 +289,75 @@ export function decodeRecording(frames: readonly RecordingFrame[], eccPrivateKey
     missingFrames,
     durationMs,
     fps: durationMs > 0 && span > 0 ? Math.round((span * 100_000) / durationMs) / 100 : 0,
+  };
+}
+
+/**
+ * LOCAL: a fresh 1024-bit RSA key for one download from a camera that is its own station: the private key, and the
+ * public modulus as the request names it (upper-case hex, no leading zero byte).
+ */
+export function rsaRecordingKey(): { privateKey: KeyObject; modulusHex: string } {
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 1024, publicExponent: 65537 });
+  const n = publicKey.export({ format: "jwk" }).n ?? "";
+  return { privateKey, modulusHex: Buffer.from(n, "base64url").toString("hex").toUpperCase() };
+}
+
+/** RSA without padding, then the PKCS#1 v1.5 padding taken off by hand (Node refuses that padding on decrypt). */
+function rsaOpen(privateKey: KeyObject, sealed: Buffer): Buffer | undefined {
+  try {
+    const block = privateDecrypt({ key: privateKey, padding: constants.RSA_NO_PADDING }, sealed);
+    if (block[0] !== 0x00 || block[1] !== 0x02) return undefined;
+    const end = block.indexOf(0x00, 2);
+    return end > 9 ? block.subarray(end + 1) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * LOCAL: decode a recording a camera that is its own station sent under the client's own RSA key. A sealed frame
+ * (signCode > 0) carries its AES key RSA-sealed in the 128 bytes after the header; under that key only the first
+ * 128 bytes of the picture are AES-128-ECB, the rest is in the clear. A frame not sealed is in the clear whole.
+ * Video only: the sound of such a recording is not read yet.
+ */
+export function decodeRsaRecording(frames: readonly RecordingFrame[], privateKey: KeyObject): RecordingDownload {
+  const video: Buffer[] = [];
+  const sequences = new Set<number>();
+  let firstStamp: number | undefined;
+  let lastStamp: number | undefined;
+  for (const { commandId, signCode, raw } of frames) {
+    if (commandId !== CommandType.CMD_VIDEO_FRAME) continue;
+    const header = parseVideoFrameHeader(raw);
+    if (!header) continue;
+    let start = VIDEO_HEADER_LEN;
+    let aesKey: Buffer | undefined;
+    if (signCode > 0 && header.payloadLength >= 128 && raw.length >= VIDEO_HEADER_LEN + 129) {
+      aesKey = rsaOpen(privateKey, raw.subarray(VIDEO_HEADER_LEN, VIDEO_HEADER_LEN + 128));
+      if (!aesKey || aesKey.length !== 16) continue;
+      start = VIDEO_HEADER_LEN + 129;
+    }
+    const body = raw.subarray(start, start + header.payloadLength);
+    let picture = body;
+    if (aesKey) {
+      const head = body.subarray(0, 128);
+      const decipher = createDecipheriv("aes-128-ecb", aesKey, null);
+      decipher.setAutoPadding(false);
+      picture = Buffer.concat([decipher.update(head), decipher.final(), body.subarray(128)]);
+    }
+    if (!picture.length) continue;
+    video.push(picture);
+    sequences.add(header.sequence);
+    const stamp = raw.readUIntLE(0x0e, 6);
+    firstStamp ??= stamp;
+    lastStamp = stamp;
+  }
+  if (!video.length) throw new RecordingDownloadError("undecodable", "no video frame of the recording decoded");
+  const durationMs = (lastStamp ?? 0) - (firstStamp ?? 0);
+  return {
+    video: Buffer.concat(video),
+    frames: sequences.size,
+    missingFrames: 0,
+    durationMs,
+    fps: durationMs > 0 && sequences.size > 1 ? Math.round(((sequences.size - 1) * 100_000) / durationMs) / 100 : 0,
   };
 }

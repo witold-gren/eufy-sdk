@@ -62,8 +62,10 @@ import { freshestLanIp } from "./lan-ip.js";
 import { captureSnapshotFromShared, recordClip } from "./media.js";
 import {
   decodeRecording,
+  decodeRsaRecording,
   homeBase2RecordingPath,
   receiveRecording,
+  rsaRecordingKey,
   type RecordingTransfer,
 } from "./recording-download.js";
 import type { FfmpegLevel } from "../ffmpeg.js";
@@ -848,7 +850,9 @@ export class P2PCommandRouter {
     const dev = this.recordFor(sn);
     if (!dev) return false;
     const parentSn = stationOf(dev);
-    return parentSn !== sn && this.recordFor(parentSn)?.model === "T8010";
+    // LOCAL: a camera that is its own station names the file of each recording in its `history_record_info`
+    // (`storage_path`), in the HomeBase 2 layout; it downloads by that path.
+    return parentSn === sn || this.recordFor(parentSn)?.model === "T8010";
   }
 
   /**
@@ -891,8 +895,26 @@ export class P2PCommandRouter {
     opts: RecordingDownloadOpts,
   ): Promise<{ recording: Promise<RecordingDownload>; drained: Promise<void> }> {
     const { session, parentSn, channel, accountId } = await this.resolveSession(sn, { signal: opts.signal });
-    const path = homeBase2RecordingPath(channel, opts.recording);
+    // LOCAL: the path the station's own table names (`storage_path`), where it lies under the station's card.
+    const named = opts.path && /^\/media\/mmcblk\d+p\d+\/Camera\d{2}\/[\w]+\.dat$/.test(opts.path) ? opts.path : undefined;
+    const path = named ?? homeBase2RecordingPath(channel, opts.recording);
     if (!path) throw new RecordingDownloadError("invalid-recording", `no recording named ${opts.recording}`);
+    if (parentSn === sn) {
+      // LOCAL: a camera that is its own station seals its recordings under a key the client sends, not a cloud cipher.
+      const { privateKey, modulusHex } = rsaRecordingKey();
+      const transfer = receiveRecording(session, {
+        path,
+        accountId,
+        channel,
+        timeoutMs: opts.timeoutMs,
+        signal: opts.signal,
+        rsaModulusHex: modulusHex,
+      });
+      return {
+        recording: transfer.frames.then((frames) => decodeRsaRecording(frames, privateKey)),
+        drained: transfer.drained,
+      };
+    }
     const eccKey = (await this.cipherKeysFor(session, opts.cipherId, accountId, parentSn))?.ecc;
     if (!eccKey) {
       throw new RecordingDownloadError("key-unavailable", `cipher ${opts.cipherId} could not be obtained`);

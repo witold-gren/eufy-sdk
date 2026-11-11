@@ -945,7 +945,7 @@ export interface MediaProvider {
    * Optional, and absent on a camera whose station's recording download is unverified.
    */
   downloadRecording?(
-    opts: { recording: string; cipherId: number; timeoutMs?: number } & AbortableCall,
+    opts: { recording: string; cipherId: number; path?: string; timeoutMs?: number } & AbortableCall,
   ): Promise<RecordingDownload>;
   /**
    * Generic P2P request/reply query: send a `SET_PAYLOAD` sub-command and resolve with the reply
